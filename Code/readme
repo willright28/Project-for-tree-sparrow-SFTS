@@ -1,1 +1,5 @@
+0.genetic.parameter.sh: codes used to do genetic population analyses;
 
+1.detect.outliers.txt: R code used to detect climate-associated SNPs；
+
+2.GO.validation.txt: R code used to validate genomic offset and plot.
