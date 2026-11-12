@@ -1,0 +1,198 @@
+library(raster)
+library(vegan)
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(modEvA)#MESS
+#library(rgdal)
+library(lme4)
+library(dplyr)
+
+
+#ID
+ID.1900s <- fread("1900s.012.indv",header=T)
+ID.2000s <- fread("2000s.012.indv",header=T)
+
+#load env and site xy
+#range
+eu.shp <- shapefile("shp/Europe.shp")
+eur_50k <- spsample(eu.shp,n=120000,"regular")
+eur_50k <- eur_50k@coords %>% as.data.frame()
+names(eur_50k) <- c("x", "y")
+
+#xy
+site_1900s <- fread("1900s.site",header=T)
+site_2000s <- fread("2000s.site",header=T)
+
+#env
+env_1900s <- stack("bioclim_1900s_ens.tif")
+env_2000s <- stack("bioclim_2000s_ens.tif")
+
+#extract env
+#1900s
+var <- c("bio05","bio06","bio18","bio19")
+extr_1900s <- terra::extract(env_1900s[[var]],site_1900s,method="bilinear",ID=F)
+
+extr_1900s_scale <- scale(extr_1900s, center=TRUE, scale=TRUE)
+scale_env_1900s <- attr(extr_1900s_scale, 'scaled:scale')
+center_env_1900s <- attr(extr_1900s_scale, 'scaled:center')
+
+#project 2000s to 1900s space
+extr_2000s <- terra::extract(env_2000s[[var]],site_2000s,method="bilinear",ID=F)
+extr_2000s_scale <- scale(extr_2000s, center=center_env_1900s, scale=scale_env_1900s)
+
+#genotype 012
+rda.1900s.o <- fread("1900s.genotype")
+rda.2000s.o <- fread("2000s.genotype")
+
+geno_comb <- rbind(rda.1900s.o,rda.2000s.o)
+geno_comb_centered <- scale(geno_comb, center = TRUE, scale = FALSE)
+n1900 <- nrow(rda.1900s.o)
+geno_1900s_centered <- geno_comb_centered[1:n1900, ]
+geno_2000s_centered <- geno_comb_centered[(n1900+1):nrow(geno_comb_centered), ]
+
+#RDA
+rda_1900s <- rda(X = geno_1900s_centered, Y =extr_1900s_scale, scale = FALSE)
+rda_2000s <- rda(X = geno_2000s_centered, Y =extr_2000s_scale, scale = FALSE)
+RsquareAdj(rda_1900s)
+RsquareAdj(rda_2000s)
+anova(rda_1900s);anova(rda_2000s)
+
+#project across Europe
+eur_1900s_50k <- raster::extract(env_1900s[[var]], eur_50k,method="bilinear",ID=F) %>% as.data.frame()
+eur_1900s_50k_scale <- scale(eur_1900s_50k, center=center_env_1900s, scale=scale_env_1900s)
+eur_1900s_50k_scale <- cbind(eur_50k,eur_1900s_50k_scale) %>% na.omit
+
+
+eur_2000s_50k <- terra::extract(env_2000s[[var]], eur_50k,method="bilinear",ID=F) %>% as.data.frame()
+eur_2000s_50k_scale <- scale(eur_2000s_50k, center=center_env_1900s, scale=scale_env_1900s)
+eur_2000s_50k_scale <- cbind(eur_50k,eur_2000s_50k_scale) %>% na.omit
+
+#MESS
+mess.a 	<- MESS(eur_1900s_50k,
+               eur_2000s_50k)
+mess.a <- cbind(eur_50k,mess.a)
+range(mess.a$TOTAL)
+
+#procrustes test 
+A_raw <- predict(rda_1900s, newdata = eur_1900s_50k_scale[,c("bio05","bio06","bio18","bio19")], type = "response") 
+c_raw_b <- predict(rda_2000s, newdata = eur_2000s_50k_scale[,c("bio05","bio06","bio18","bio19")], type = "response")
+pca_A <- prcomp(A_raw, center = TRUE, scale. = FALSE)
+pca_C <- prcomp(c_raw_b, center = TRUE, scale. = FALSE)
+A_pca <- pca_A$x[, 1:3]
+C_pca <- pca_C$x[, 1:3]
+pro_test <- procrustes(X = A_pca, Y = C_pca,symmetric = T)
+pro_sig <- protest(X = A_pca, Y = C_pca, permutations = 999,symmetric = T)
+summary(pro_sig)
+
+#GO validation calculation
+A_raw <- predict(rda_1900s, newdata = eur_1900s_50k_scale[,c("bio05","bio06","bio18","bio19")], type = "response") 
+B_raw <- predict(rda_1900s, newdata = eur_2000s_50k_scale[,c("bio05","bio06","bio18","bio19")], type = "response") 
+C_raw <- predict(rda_2000s, newdata = eur_2000s_50k_scale[,c("bio05","bio06","bio18","bio19")], type = "response") 
+mag_AB <- sqrt(rowSums((B_raw - A_raw)^2))
+mag_AC <- sqrt(rowSums((C_raw - A_raw)^2))
+mag_BC <- sqrt(rowSums((C_raw - B_raw)^2))
+vec_AB <- B_raw - A_raw
+vec_AC <- C_raw - A_raw
+dot_product <- rowSums(vec_AB * vec_AC)
+cos_theta <- dot_product / (mag_AB * mag_AC)
+
+#project gentic compostion on map
+scaled_pixel_LC <- predict(rda_2000s, 
+                           newdata=eur_2000s_50k_scale[,c("bio05","bio06","bio18","bio19")], 
+                           type="lc")
+TAB_pixel_LC<- data.frame(lat = eur_50k$y, long = eur_50k$x, scaled_pixel_LC)
+TAB_var <- as.data.frame(scores(rda_2000s, choices=c(1:4), display="bp"))
+### mapping with palette
+a1 <- TAB_pixel_LC$RDA1
+a2 <- TAB_pixel_LC$RDA2
+
+dist_origin <- sqrt(a1^2 + a2^2)
+dist_norm <- (dist_origin - min(dist_origin)) / (max(dist_origin) - min(dist_origin))
+
+# Red for negative RDA1
+red <- pmax(-a1, 0)
+# Blue for positive RDA1
+blue <- pmax(a1, 0)
+# Green for positive RDA2
+green <- pmax(a2, 0)
+
+red <- (red - min(red)) / (max(red) - min(red) + 1e-6) * 255
+green <- (green - min(green)) / (max(green) - min(green) + 1e-6) * 255
+blue <- (blue - min(blue)) / (max(blue) - min(blue) + 1e-6) * 255
+
+grey_factor <- dist_norm        # 0 = near origin, 1 = far
+grey_target <- 200             # lighter grey target (closer to white) used 220
+baseline_grey <- 0.4         # ensures center points are not black used 0.4
+
+boost_factor <- 1.05
+red   <- pmin(((red   / 255) ^ 0.5) * 255 * boost_factor, 255)
+green <- pmin(((green / 255) ^ 0.5) * 255 * boost_factor, 255)
+blue  <- pmin(((blue  / 255) ^ 0.5) * 255 * boost_factor, 255)
+
+r_adj <- (1 - grey_factor) * ((1 - baseline_grey) * red   + baseline_grey * grey_target) +
+  grey_factor * grey_target
+g_adj <- (1 - grey_factor) * ((1 - baseline_grey) * green + baseline_grey * grey_target) +
+  grey_factor * grey_target
+b_adj <- (1 - grey_factor) * ((1 - baseline_grey) * blue  + baseline_grey * grey_target) +
+  grey_factor * grey_target
+
+# Final RGB colors
+colors <- rgb(r_adj, g_adj, b_adj, maxColorValue = 255)
+
+#plot
+#rda12
+ggplot(as.data.frame(TAB_pixel_LC)) +
+  geom_point(aes(x = RDA1, y = RDA2),
+             color = colors,
+             size = 2, shape = 21, fill = colors, stroke = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = gray(0.80), linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = gray(0.80), linewidth = 0.6) +
+  geom_segment(data = TAB_var, aes(xend = RDA1, yend = RDA2, x = 0, y = 0), 
+               colour = "black", size = 0.15, linetype = 1, 
+               arrow = arrow(length = unit(0.20, "cm"), type = "closed")) +
+  geom_label_repel(data = TAB_var, aes(x = RDA1, y = RDA2, label = row.names(TAB_var)), 
+                   size = 4, family = "serif") +
+  theme_bw(base_size = 9, base_family = "serif") +
+  theme(panel.background = element_blank(), 
+        legend.background = element_blank(), 
+        panel.grid = element_blank(), 
+        plot.background = element_blank(), 
+        legend.text = element_text(size = rel(0.8)), 
+        strip.text = element_text(size = 9)) +
+  scale_color_identity()
+
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+eurasia <- ne_countries(continent = c("Europe", "Asia"), 
+                        scale = "large", 
+                        returnclass = "sf")
+
+TAB_pixel_LC_sf <- st_as_sf(TAB_pixel_LC,
+                            coords = c("long", "lat"),
+                            crs = 4326,
+                            remove = FALSE)  # Keeps original long/lat columns
+library(scales)
+
+TAB_pixel_LC_sf$colors_alpha_RDA12 <- scales::alpha(colors, 1)
+
+
+rda.axis12.map <- ggplot(data = eurasia) +
+  geom_sf(fill = "#EBEBEB", color = "black") +
+  geom_raster(data = TAB_pixel_LC_sf,
+              aes(x = TAB_pixel_LC_sf$long, y = TAB_pixel_LC_sf$lat, fill = TAB_pixel_LC_sf$colors_alpha_RDA12),
+              alpha = 0.8, show.legend = FALSE) +
+  scale_fill_identity() +   
+  coord_sf(xlim = c(-13.5, 55), ylim = c(35, 72), expand = FALSE) +
+  theme_bw(base_size = 9, base_family = "serif") +
+  theme(panel.background = element_blank(), 
+        legend.background = element_blank(), 
+        panel.grid = element_blank(), 
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        
+        plot.background = element_blank(), 
+        legend.text = element_text(size = rel(0.8)), 
+        strip.text = element_text(size = 9))

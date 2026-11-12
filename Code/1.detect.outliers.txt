@@ -1,0 +1,104 @@
+# Minimal example: outlier identification for one population (CN 1900s)
+# Includes MEM construction and MEM-conditioned RDA.
+
+library(data.table)
+library(vegan)
+library(adespatial)
+
+# ---------- Input ----------
+indv_all <- fread("indv_all.csv")  # ID, x, y, bio05, bio06, bio18, bio19
+cn.list  <- fread("1900sCN.012.indv", header = TRUE)
+
+read_geno <- function(file, prefix = "V") {
+  geno <- fread(file, header = FALSE) |> as.matrix()
+  colnames(geno) <- paste0(prefix, seq_len(ncol(geno)))
+  mono <- apply(geno, 2, function(x) length(unique(x)) == 1)
+  geno[, !mono, drop = FALSE]
+}
+
+geno_cn <- read_geno("1900sCN.genotype")
+
+env <- indv_all[cn.list, on = "ID", .(bio05, bio06, bio18, bio19)]
+xy  <- indv_all[cn.list, on = "ID", .(x, y)] |> as.matrix()
+
+# ---------- Outlier helper ----------
+outliers <- function(x, z) {
+  lims <- mean(x) + c(-1, 1) * z * sd(x)
+  x[x < lims[1] | x > lims[2]]
+}
+
+run_rda_candidates <- function(rda_obj, geno, env, axes = 1:4, z = 3) {
+  load.rda <- scores(rda_obj, choices = axes, display = "species")
+  if (is.null(dim(load.rda))) load.rda <- matrix(load.rda, ncol = 1)
+
+  cand_list <- lapply(seq_along(axes), function(k) {
+    out <- outliers(load.rda[, k], z)
+    if (!length(out)) return(NULL)
+    data.frame(axis = k, snp = names(out), loading = unname(out),
+               stringsAsFactors = FALSE)
+  })
+  cand <- do.call(rbind, cand_list)
+  if (is.null(cand) || !nrow(cand)) return(NULL)
+
+  env_df <- as.data.frame(env)
+  env_names <- colnames(env_df)
+  foo <- matrix(NA_real_, nrow(cand), length(env_names),
+                dimnames = list(NULL, env_names))
+
+  for (i in seq_len(nrow(cand))) {
+    nam <- cand$snp[i]
+    if (!nam %in% colnames(geno)) next
+    foo[i, ] <- apply(env_df, 2, function(x)
+      cor(x, geno[, nam], use = "pairwise.complete.obs"))
+  }
+
+  cand <- cbind(cand, foo)
+  cand <- cand[!duplicated(cand$snp), , drop = FALSE]
+
+  cor_cols <- which(colnames(cand) %in% env_names)
+  cand$predictor <- apply(cand[, cor_cols, drop = FALSE], 1,
+                          function(x) env_names[which.max(abs(x))])
+  cand$correlation <- apply(cand[, cor_cols, drop = FALSE], 1,
+                            function(x) max(abs(x), na.rm = TRUE))
+  cand
+}
+
+# ---------- MEM conditioning ----------
+d  <- dist(xy)
+th <- quantile(d, 0.15)
+
+mem <- dbmem(xy, thresh = th, MEM.autocor = "positive", silent = TRUE)
+
+gen_dist <- vegdist(geno_cn, method = "bray")
+pcoa <- cmdscale(gen_dist, k = attr(gen_dist, "Size") - 1, eig = TRUE)
+
+eig_pos <- pcoa$eig[pcoa$eig > 0]
+bs_fit  <- bstick(eig_pos, n = length(eig_pos))
+keep    <- which(pcoa$eig > bs_fit)
+
+pcoa_axes <- as.data.frame(pcoa$points[, keep, drop = FALSE])
+colnames(pcoa_axes) <- paste0("PCoA", keep)
+
+rda_full <- rda(pcoa_axes ~ ., data = mem)
+R2_full  <- RsquareAdj(rda_full)$adj.r.squared
+
+mem_fwd <- forward.sel(Y = pcoa_axes, X = mem,
+                       adjR2thresh = R2_full, nperm = 999, alpha = 0.05)
+mem_sel_names <- mem_fwd$variables
+mem_sel <- mem[, mem_sel_names, drop = FALSE]
+
+alpha_env <- 0.05 / length(keep)
+env_cor_p <- sapply(mem_sel_names, function(m) {
+  min(sapply(env, function(e)
+    cor.test(mem_sel[[m]], e, method = "spearman")$p.value))
+})
+
+mem_keep <- mem_sel_names[env_cor_p > alpha_env]
+mem_conditioning <- if (length(mem_keep)) mem[, mem_keep, drop = FALSE] else NULL
+
+# ---------- MEM-conditioned RDA and outlier detection ----------
+rda_cn  <- rda(X = geno_cn, Y = env, Z = mem_conditioning)
+cand_cn <- run_rda_candidates(rda_cn, geno_cn, env, axes = 1:4, z = 3)
+
+fwrite(data.frame(snp = cand_cn$snp), "pRDA.mem.cn1900s.txt",
+       row.names = FALSE, col.names = FALSE)
